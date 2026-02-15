@@ -1,186 +1,56 @@
-name: Persistent Runner 24/7
+name: OB 24/7
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 */4 * * *'  # Chạy mỗi 4 giờ (dự phòng chính)
-    - cron: '30 */2 * * *' # Chạy mỗi 2 giờ (dự phòng phụ)
+    - cron: '0 5 * * *'
+    - cron: '0 10 * * *'
+    - cron: '0 15 * * *'
+    - cron: '0 20 * * *'
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+  watch:
+    types: started
 
 jobs:
-  run:
+  run-ob:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6 giờ tối đa
+    timeout-minutes: 360 # 6 tiếng
 
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-    - name: Install
+    - name: Install dependencies
       run: |
-        pip install gdown
-        sudo apt-get update && sudo apt-get install -y curl jq
-
-    - name: Download
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip
+        pip3 install gdown
+        
+    - name: Download api
       run: |
         FILE_ID="1kmkI5AtdpHrBG4ml-FIO8xHExlKJ81BO"
         gdown "https://drive.google.com/uc?id=${FILE_ID}" -O api
         chmod +x api
-        
-        # Backup file để đề phòng
-        cp api api.backup
 
-    - name: Setup 24/7 restart system
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Kill old processes
       run: |
-        # Tạo script restart chính
-        cat > restart-core.sh << 'EOF'
-        #!/bin/bash
-        
-        REPO="$1"
-        BRANCH="$2"
-        TOKEN="$3"
-        WORKFLOW="Persistent Runner 24/7"
-        
-        # Vòng lặp restart vô hạn
+        pkill -f "api" 2>/dev/null || true
+        sleep 3
+
+    - name: Run api 24/7 with auto-restart
+      run: |
+        # Vòng lặp vô hạn để giữ OB chạy 24/7
         while true; do
-            # Restart sau 3h30m (dự phòng 30 phút)
-            sleep 12600
-            
-            echo "Triggering restart at $(date)"
-            
-            # Method 1: workflow_dispatch
-            curl -L -X POST \
-              -H "Authorization: token $TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW/dispatches" \
-              -d "{\"ref\":\"$BRANCH\"}" || echo "Method 1 failed"
-            
-            # Method 2: repository_dispatch
-            curl -L -X POST \
-              -H "Authorization: token $TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/dispatches" \
-              -d "{\"event_type\":\"restart-24-7\",\"client_payload\":{\"time\":\"$(date)\"}}" || echo "Method 2 failed"
-            
-            # Method 3: Gọi trực tiếp API (dự phòng)
-            curl -L -X POST \
-              -H "Authorization: token $TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/actions/workflows/restart-24-7/dispatches" \
-              -d "{\"ref\":\"$BRANCH\"}" || echo "Method 3 failed"
-            
-            echo "Restart triggered, continuing monitoring..."
+          echo "[$(date)] Starting api..."
+          ./api &
+          API_PID=$!
+          echo "[$(date)] api started with PID: $API_PID"
+          
+          # Theo dõi process
+          while kill -0 $API_PID 2>/dev/null; do
+            sleep 30
+          done
+          
+          echo "[$(date)] api stopped! Restarting in 5 seconds..."
+          sleep 5
         done
-        EOF
-        
-        chmod +x restart-core.sh
-        
-        # Tạo script watchdog
-        cat > watchdog.sh << 'EOF'
-        #!/bin/bash
-        
-        MAIN_PID=$1
-        LOG_FILE="program.log"
-        
-        while true; do
-            # Kiểm tra process chính còn sống không
-            if ! kill -0 $MAIN_PID 2>/dev/null; then
-                echo "Program died at $(date), restarting..."
-                ./api >> $LOG_FILE 2>&1 &
-                MAIN_PID=$!
-            fi
-            
-            # Kiểm tra program có bị treo không (no output trong 10 phút)
-            if [ -f $LOG_FILE ]; then
-                LAST_MOD=$(stat -c %Y $LOG_FILE)
-                NOW=$(date +%s)
-                if [ $((NOW - LAST_MOD)) -gt 600 ]; then
-                    echo "Program frozen at $(date), killing and restarting..."
-                    kill -9 $MAIN_PID 2>/dev/null
-                    ./api >> $LOG_FILE 2>&1 &
-                    MAIN_PID=$!
-                fi
-            fi
-            
-            sleep 60
-        done
-        EOF
-        
-        chmod +x watchdog.sh
-        
-        # Tạo script heartbeat
-        cat > heartbeat.sh << 'EOF'
-        #!/bin/bash
-        
-        while true; do
-            echo "$(date) - Running" >> heartbeat.log
-            
-            # Kiểm tra kết nối internet
-            if ! ping -c 1 google.com >/dev/null 2>&1; then
-                echo "Network issue at $(date)" >> heartbeat.log
-            fi
-            
-            # Kiểm tra resource usage
-            CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
-            MEM=$(free -m | awk 'NR==2{printf "%.2f%%", $3*100/$2}')
-            echo "$(date) - CPU: $CPU, MEM: $MEM" >> resources.log
-            
-            sleep 300 # 5 phút
-        done
-        EOF
-        
-        chmod +x heartbeat.sh
-        
-        # Khởi chạy tất cả hệ thống
-        export REPO="${{ github.repository }}"
-        export BRANCH="${GITHUB_REF#refs/heads/}"
-        export GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-        
-        # Chạy restart core trong background
-        nohup ./restart-core.sh "$REPO" "$BRANCH" "$GH_TOKEN" > restart.log 2>&1 &
-        echo "Restart core started: PID $!"
-        
-        # Chạy heartbeat trong background
-        nohup ./heartbeat.sh > /dev/null 2>&1 &
-        echo "Heartbeat started: PID $!"
-        
-        echo "24/7 system initialized at $(date)"
-
-    - name: Run program with watchdog
-      run: |
-        echo "Starting main program at $(date)"
-        
-        # Khởi động program
-        ./api 2>&1 | tee -a program.log &
-        MAIN_PID=$!
-        
-        # Chạy watchdog
-        nohup ./watchdog.sh $MAIN_PID > watchdog.log 2>&1 &
-        
-        echo "Program PID: $MAIN_PID"
-        echo "Watchdog started"
-        
-        # Giữ cho step chạy
-        wait $MAIN_PID
-
-    - name: Emergency restart
-      if: failure()
-      run: |
-        echo "Workflow failed at $(date), triggering emergency restart"
-        curl -L -X POST \
-          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Accept: application/vnd.github.v3+json" \
-          "https://api.github.com/repos/${{ github.repository }}/actions/workflows/Persistent%20Runner%2024%2F7/dispatches" \
-          -d '{"ref":"${{ github.ref_name }}"}'
-
-    - name: Keep logs
-      if: always()
-      run: |
-        # Lưu logs để debug
-        echo "=== Final Status at $(date) ==="
-        echo "Program log last 20 lines:"
-        tail -20 program.log 2>/dev/null || echo "No program log"
-        echo "Heartbeat status:"
-        tail -5 heartbeat.log 2>/dev/null || echo "No heartbeat"
-        echo "Resource usage:"
-        tail -5 resources.log 2>/dev/null || echo "No resource log"
